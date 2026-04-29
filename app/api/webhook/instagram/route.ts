@@ -1,30 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CLIENTS
-// ─────────────────────────────────────────────────────────────────────────────
+import Anthropic from "@anthropic-ai/sdk";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TYPES
-// ─────────────────────────────────────────────────────────────────────────────
-
-type BotStatus = "BOT_ACTIVE" | "WAITING_FOR_DOCTOR" | "DOCTOR_REPLIED";
-
-type MessageIntent =
-  | "NEW_PHOTO"
-  | "ASKING_QUESTION"
-  | "YES_TO_BOOKING"
-  | "NO_TO_BOOKING"
-  | "GENERAL";
+type BotStatus =
+  | "BOT_ACTIVE"
+  | "WAITING_FOR_CONSENT"
+  | "WAITING_FOR_DOCTOR"
+  | "DOCTOR_REPLIED"
+  | "ARCHIVED"
+  | "WAITING_FOR_APPOINTMENT_INTENT";
 
 interface CustomerProfile {
   name:              string | null;
@@ -37,22 +28,23 @@ interface CustomerProfile {
 }
 
 interface AIExtracted {
-  reply:     string;
+  reply: string;
   extracted: {
     full_name:    string | null;
     phone:        string | null;
-    booking_day:  string | null; // e.g. "Sun", "Mon"
-    booking_time: string | null; // e.g. "11a", "3p"
+    booking_day:  string | null;
+    booking_time: string | null;
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONSTANTS — single source of truth for slots, labels, model name
-// ─────────────────────────────────────────────────────────────────────────────
-
-// FIX: gemini-1.5-flash-latest returns 404 with some API keys.
-// gemini-2.0-flash is the correct current model.
-const GEMINI_MODEL = "gemini-flash-latest";
+interface TriageSession {
+  name:              string | null;
+  phone:             string | null;
+  photo_url:         string | null;
+  biz_id:            number | null;
+  photo_requested:   boolean;
+  last_photo_ask_at: string | null;
+}
 
 const DAY_LABEL: Record<string, string> = {
   Mon: "Lundi", Tue: "Mardi", Wed: "Mercredi",
@@ -65,25 +57,102 @@ const TIME_LABEL: Record<string, string> = {
 };
 
 const DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const recentlyProcessed = new Set<string>();
+const recentlySentReplies = new Map<string, { text: string; at: number }>();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INTENT DETECTION
+// IMAGE
 // ─────────────────────────────────────────────────────────────────────────────
 
-function detectIntent(text: string, imageUrl: string | null): MessageIntent {
-  if (imageUrl) return "NEW_PHOTO";
-  const t = text.toLowerCase().trim();
-  if (!t) return "GENERAL";
-  const QUESTION_PATTERNS = [
-    /goli[a]?\s*b3da/, /\bchno\s*khass/, /\bwach\s*khass/, /\bkifash/,
-    /\b3lash\b/, /\bchhal\b|\bch7al\b/, /\bprix\b|\bcombien\b/,
-    /\bhow\s+much\b/, /\bwhat\s+(do|should|can)\b/, /\?/,
-    /\bma3rftch\b|\bfahmtch\b/, /\bchno\s+hiya\b/, /\b(explain|tell me|goli)\b/,
-  ];
-  if (QUESTION_PATTERNS.some((p) => p.test(t))) return "ASKING_QUESTION";
-  if (/\b(iyeh|ah\b|oui|yes|wakha|mashi\s*mochkil|bghit|agree|ok\b|okay)\b/.test(t)) return "YES_TO_BOOKING";
-  if (/\b(la\b|non\b|no\b|ma\s*bghitch|machi\s*daba|later)\b/.test(t)) return "NO_TO_BOOKING";
-  return "GENERAL";
+function extractImageUrl(attachments: any[]): string | null {
+  if (!attachments || attachments.length === 0) return null;
+  for (const att of attachments) {
+    if (att.type === "image" && att.payload?.url) return att.payload.url;
+    if (att.type === "image" && att.image_data?.url) return att.image_data.url;
+    if (att.payload?.url) return att.payload.url;
+    if (att.url) return att.url;
+  }
+  return null;
+}
+
+async function fetchImageUrlFromGraphAPI(
+  messageId: string,
+  pageAccessToken: string
+): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/v25.0/${messageId}?fields=message,attachments&access_token=${pageAccessToken}`
+    );
+    const data = await res.json();
+    console.log("[GRAPH API]", res.status, JSON.stringify(data));
+    if (!res.ok) return null;
+    const atts = data?.attachments?.data ?? data?.attachments ?? [];
+    for (const att of atts) {
+      const url =
+        att?.image_data?.url ??
+        att?.payload?.url ??
+        att?.file_url ??
+        att?.url ??
+        null;
+      if (url) return url;
+    }
+    return data?.image_data?.url ?? data?.url ?? null;
+  } catch (err) {
+    console.error("[GRAPH API] Exception:", err);
+    return null;
+  }
+}
+
+async function saveDentalPhoto(
+  instagramUrl: string,
+  senderId: string,
+  pageAccessToken: string
+): Promise<string | null> {
+  try {
+    const H = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      Accept: "image/*,*/*",
+    };
+    let res = await fetch(instagramUrl, { headers: H });
+    if (!res.ok && pageAccessToken) {
+      const u = instagramUrl.includes("?")
+        ? `${instagramUrl}&access_token=${pageAccessToken}`
+        : `${instagramUrl}?access_token=${pageAccessToken}`;
+      res = await fetch(u, { headers: H });
+    }
+    if (!res.ok) {
+      console.error(`[PHOTO] fetch failed: ${res.status}`);
+      return null;
+    }
+    const buffer = await res.arrayBuffer();
+    if (!buffer || buffer.byteLength < 1000) {
+      console.error(`[PHOTO] invalid buffer: ${buffer?.byteLength} bytes`);
+      return null;
+    }
+    const ct = res.headers.get("content-type") ?? "image/jpeg";
+    if (!ct.startsWith("image/") && !ct.includes("octet-stream")) {
+      console.error(`[PHOTO] bad content-type: ${ct}`);
+      return null;
+    }
+    const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
+    const path = `patients/${senderId}/${Date.now()}.${ext}`;
+    const { error } = await supabase.storage
+      .from("dental-images")
+      .upload(path, buffer, { contentType: ct, upsert: true });
+    if (error) {
+      console.error("[PHOTO] upload failed:", error.message);
+      return null;
+    }
+    const { data: urlData } = supabase.storage
+      .from("dental-images")
+      .getPublicUrl(path);
+    console.log(`[PHOTO] Saved: ${urlData.publicUrl}`);
+    return urlData.publicUrl;
+  } catch (err) {
+    console.error("[PHOTO] Exception:", err);
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,12 +167,14 @@ function extractPhoneFromText(text: string): string | null {
 function extractDayFromText(text: string): string | null {
   const CODES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const todayIdx = new Date().getDay();
-  const t = text.toLowerCase().replace(/[-_.]/g, " ").replace(/\s+/g, " ").trim();
-
+  const t = text
+    .toLowerCase()
+    .replace(/[-_.]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (/ba3d\s*ghda|ba3dghda/.test(t)) return CODES[(todayIdx + 2) % 7];
   if (/\bghda\b|\bghdda\b|\bdemain\b/.test(t)) return CODES[(todayIdx + 1) % 7];
   if (/\bhad\s+nhar\b|\blyoum\b/.test(t)) return CODES[todayIdx];
-
   const PATTERNS: Array<[RegExp, string]> = [
     [/(?:nhar\s*)?(?:l\s*)?(?:t[h]?nin|itnin|lundi|monday|\bmon\b)/, "Mon"],
     [/(?:nhar\s*)?(?:l\s*)?(?:t{1,2}\s*[ah]?lata|mardi|tuesday|\btue\b)/, "Tue"],
@@ -121,23 +192,23 @@ function extractDayFromText(text: string): string | null {
 
 function extractTimeFromText(text: string): string | null {
   const t = text.toLowerCase();
-  const slangMatch = t.match(/\bl(\d{1,2})\b/);
-  if (slangMatch) {
-    const h = parseInt(slangMatch[1]);
-    const map: Record<number, string> = { 1: "1p", 3: "3p", 4: "4p", 5: "5p", 9: "9a", 11: "11a" };
-    if (map[h]) return map[h];
+  const sm = t.match(/\bl(\d{1,2})\b/);
+  if (sm) {
+    const h = parseInt(sm[1]);
+    const m: Record<number, string> = { 1: "1p", 3: "3p", 4: "4p", 5: "5p", 9: "9a", 11: "11a" };
+    if (m[h]) return m[h];
   }
-  const m3aMatch = t.match(/m3a\s*(\d{1,2})/);
-  if (m3aMatch) {
-    const h = parseInt(m3aMatch[1]);
-    const map: Record<number, string> = { 9: "9a", 11: "11a", 1: "1p", 13: "1p", 3: "3p", 15: "3p", 4: "4p", 16: "4p", 5: "5p", 17: "5p" };
-    if (map[h]) return map[h];
+  const m3 = t.match(/m3a\s*(\d{1,2})/);
+  if (m3) {
+    const h = parseInt(m3[1]);
+    const m: Record<number, string> = { 9: "9a", 11: "11a", 1: "1p", 13: "1p", 3: "3p", 15: "3p", 4: "4p", 16: "4p", 5: "5p", 17: "5p" };
+    if (m[h]) return m[h];
   }
-  const clockMatch = t.match(/\b(\d{1,2})(?:h|:00)\b/);
-  if (clockMatch) {
-    const h = parseInt(clockMatch[1]);
-    const map: Record<number, string> = { 9: "9a", 11: "11a", 1: "1p", 13: "1p", 3: "3p", 15: "3p", 4: "4p", 16: "4p", 5: "5p", 17: "5p" };
-    if (map[h]) return map[h];
+  const cm = t.match(/\b(\d{1,2})(?:h|:00)\b/);
+  if (cm) {
+    const h = parseInt(cm[1]);
+    const m: Record<number, string> = { 9: "9a", 11: "11a", 1: "1p", 13: "1p", 3: "3p", 15: "3p", 4: "4p", 16: "4p", 5: "5p", 17: "5p" };
+    if (m[h]) return m[h];
   }
   for (const slot of ["9a", "11a", "1p", "3p", "4p", "5p"]) {
     if (t.includes(slot)) return slot;
@@ -145,19 +216,14 @@ function extractTimeFromText(text: string): string | null {
   return null;
 }
 
-const NOT_A_NAME = new Set([
-  "salam", "mrhba", "wakha", "bghit", "iyeh", "la", "oui", "non", "ok", "okay",
-  "merci", "chokran", "mzyan", "smah", "lia", "daba", "chwia", "inchallah",
-  "rendez", "vous", "cabinet", "docteur", "tbib", "photo", "tswira", "hatif",
-  "telephone", "smiytek", "smiti", "smiyti", "ismi", "esmi", "ana", "kifach",
-  "wach", "chno", "chhal", "3afak", "afak", "bzaf", "bzzaf", "khoya", "lalla",
-  "sidi", "sahbi", "sahba", "labas", "bikhir", "hamdullah", "bislama",
-]);
-
 function extractNameFromText(text: string): string | null {
   const t = text.trim();
   if (!t || t.length > 50) return null;
-  const EXPLICIT = /^(?:smit[yi]|smiyti|ismi|esmi|je\s*m'?appelle|my\s*name\s*is)[\s:]+(.{3,40})$/i;
+  const AFF =
+    /^(bien\s*sur|d'?accord|ok|okay|oui|yes|wakha|iyeh|ah|mashi|ewa|yah|ouais|parfait|super|merci|noted|ayeh|marhba|salam|inchallah|hamdullah|labas|bikhir)(\s.*)?$/i;
+  if (AFF.test(t)) return null;
+  const EXPLICIT =
+    /^(?:smit[yi]|smiyti|ismi|esmi|je\s*m'?appelle|my\s*name\s*is)[\s:]+(.{3,40})$/i;
   const em = t.match(EXPLICIT);
   if (em?.[1]) return em[1].trim();
   const words = t.split(/\s+/);
@@ -165,38 +231,64 @@ function extractNameFromText(text: string): string | null {
   if (!/^[A-Za-zÀ-ÿ'\- ]{3,45}$/.test(t)) return null;
   if (/\d/.test(t)) return null;
   if (/[?!@#$%&*()+={}\[\]|<>]/.test(t)) return null;
-  const lowerWords = words.map((w) => w.toLowerCase().replace(/['\\-]/g, ""));
-  if (lowerWords.some((w) => NOT_A_NAME.has(w))) return null;
-  if (words.length === 2 && lowerWords.every((w) => NOT_A_NAME.has(w))) return null;
+  const NOT_A_NAME = new Set([
+    "salam","mrhba","wakha","bghit","iyeh","la","oui","non","ok","okay",
+    "merci","chokran","mzyan","smah","lia","daba","chwia","inchallah",
+    "rendez","vous","cabinet","docteur","tbib","photo","tswira","hatif",
+    "telephone","smiytek","smiti","smiyti","ismi","esmi","ana","kifach",
+    "wach","chno","chhal","3afak","afak","bzaf","bzzaf","khoya","lalla",
+    "sidi","sahbi","sahba","labas","bikhir","hamdullah","bislama",
+    "bien","sur","daccord","parfait","super","thanks","noted","recu",
+    "compris","mashi","mochkil","walo","lah","ewa","ah","yah","yeh",
+    "ouais","voila","exact","correcte","ayeh","marhba","ahlen",
+  ]);
+  const lw = words.map((w) => w.toLowerCase().replace(/['\\-]/g, ""));
+  if (lw.some((w) => NOT_A_NAME.has(w))) return null;
+  if (words.length === 2 && lw.every((w) => NOT_A_NAME.has(w))) return null;
   return t;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GEMINI WITH RETRY — handles 503 spikes gracefully
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function callGemini(systemInstruction: string, userMessage: string, maxRetries = 3): Promise<string> {
-  const model = genAI.getGenerativeModel({ model: GEMINI_MODEL, systemInstruction });
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const result = await model.generateContent(userMessage);
-      return result.response.text().trim();
-    } catch (err: any) {
-      const isRetryable = err?.status === 503 || err?.message?.includes("503");
-      if (isRetryable && attempt < maxRetries) {
-        const delay = attempt * 1500;
-        console.warn(`[GEMINI] 503 attempt ${attempt}, retrying in ${delay}ms...`);
-        await new Promise((r) => setTimeout(r, delay));
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error("Gemini: max retries exhausted");
+function isValidHumanName(name: string): boolean {
+  if (!name || name.trim().length < 4) return false;
+  const parts = name.trim().split(/\s+/);
+  if (parts.length < 2 || parts.length > 4) return false;
+  if (!/^[A-Za-zÀ-ÿ\s'\-]+$/.test(name)) return false;
+  const BAD =
+    /^(ayeh|iyeh|marhba|ahlen|salam|wakha|oui|yes|ok|okay|ewa|bien|sur|merci|chokran|inchallah|hamdullah|labas|bikhir|parfait|super|noted|daccord|ouais|exact|waw|na3am|ah\b)/i;
+  if (BAD.test(name.trim())) return false;
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SLOT HELPERS
+// CLAUDE
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function callClaude(system: string, user: string): Promise<string> {
+  const r = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 500,
+    system,
+    messages: [{ role: "user", content: user }],
+  });
+  const c = r.content[0];
+  if (c.type !== "text") throw new Error("Unexpected response type");
+  return c.text.trim();
+}
+
+async function callClaudeHaiku(system: string, user: string): Promise<string> {
+  const r = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 150,
+    system,
+    messages: [{ role: "user", content: user }],
+  });
+  const c = r.content[0];
+  if (c.type !== "text") throw new Error("Unexpected response type");
+  return c.text.trim();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SLOTS
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getAvailableSlots(): Promise<string> {
@@ -205,23 +297,25 @@ async function getAvailableSlots(): Promise<string> {
     .select("day, time")
     .eq("status", "open")
     .eq("is_booked", false)
-    .order("day").order("time");
-
-  if (error || !data || data.length === 0) return "Aucun créneau disponible pour le moment.";
-
+    .order("day")
+    .order("time");
+  if (error || !data || data.length === 0) return "Aucun créneau disponible.";
   const byDay: Record<string, string[]> = {};
   for (const slot of data) {
     if (!byDay[slot.day]) byDay[slot.day] = [];
     byDay[slot.day].push(TIME_LABEL[slot.time] ?? slot.time);
   }
-  return DAY_ORDER
-    .filter((d) => byDay[d])
+  return DAY_ORDER.filter((d) => byDay[d])
     .map((d) => `• ${DAY_LABEL[d]}: ${byDay[d].join(", ")}`)
     .join("\n");
 }
 
-// Try to book a slot — returns the confirmation message or null if slot unavailable
-async function bookSlot(day: string, time: string, senderId: string, patientName: string | null): Promise<string | null> {
+async function bookSlot(
+  day: string,
+  time: string,
+  senderId: string,
+  patientName: string | null
+): Promise<string | null> {
   const { data: slot, error } = await supabase
     .from("appointment_slots")
     .select("id")
@@ -230,31 +324,125 @@ async function bookSlot(day: string, time: string, senderId: string, patientName
     .eq("status", "open")
     .eq("is_booked", false)
     .maybeSingle();
-
-  if (error || !slot) return null; // slot not available
-
-  const { error: updateError } = await supabase
+  if (error || !slot) return null;
+  const { error: ue } = await supabase
     .from("appointment_slots")
     .update({
-      status:         "confirmed",
-      is_booked:      true,
-      user_id:        senderId,
+      status: "confirmed",
+      is_booked: true,
+      user_id: senderId,
       booked_by_name: patientName ?? "",
-      last_updated:   new Date().toISOString(),
+      last_updated: new Date().toISOString(),
     })
     .eq("id", slot.id);
-
-  if (updateError) {
-    console.error("[BOOKING] Update failed:", updateError.message);
+  if (ue) {
+    console.error("[BOOKING] failed:", ue.message);
     return null;
   }
-
-  console.log(`[BOOKING] ✅ Booked ${day} ${time} for ${patientName} (${senderId})`);
-  return `✅ Mzyan! Confermina lik rendez-vous nhar ${DAY_LABEL[day] ?? day} m3a ${TIME_LABEL[time] ?? time}. Ntsawro f-cabinet 😊`;
+  console.log(`[BOOKING] ✅ ${day} ${time} for ${patientName}`);
+  return `✅ Mzyan! Confermina lik rendez-vous nhar ${DAY_LABEL[day] ?? day} m3a ${TIME_LABEL[time] ?? time}. nchofok f-cabinet nchallah 😊`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET — Instagram Webhook Verification
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function sendDM(
+  recipientId: string,
+  text: string,
+  token: string
+): Promise<void> {
+  if (!recipientId || !text || !token) {
+    console.error("[DM] Missing params");
+    return;
+  }
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/v25.0/me/messages?access_token=${token}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recipient: { id: recipientId }, message: { text } }),
+      }
+    );
+    const json = await res.json();
+    if (!res.ok) console.error("[DM ERROR]:", JSON.stringify(json));
+    else console.log(`[DM SENT] "${text.substring(0, 80)}"`);
+  } catch (err) {
+    console.error("[DM FETCH ERROR]:", err);
+  }
+}
+
+async function saveMsgHistory(
+  senderId: string,
+  msgText: string,
+  replyText: string,
+  bizId: number | null
+) {
+  await supabase.from("customer_messages").insert({
+    customer_id: senderId,
+    message_text: msgText,
+    reply_text: replyText,
+    reply_sent: true,
+    timestamp: new Date(),
+    business_owner_id: bizId,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION (Supabase-backed — works on Vercel serverless)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getSession(instagramId: string): Promise<TriageSession | null> {
+  const { data } = await supabase
+    .from("triage_sessions")
+    .select("name, phone, photo_url, biz_id, photo_requested, last_photo_ask_at")
+    .eq("instagram_id", instagramId)
+    .maybeSingle();
+  return data ?? null;
+}
+
+async function setSession(
+  instagramId: string,
+  data: {
+    name?: string | null;
+    phone?: string | null;
+    photoUrl?: string | null;
+    bizId?: number | null;
+    photoRequested?: boolean;
+    lastPhotoAskAt?: string | null;
+  }
+) {
+  const payload: Record<string, unknown> = {
+    instagram_id: instagramId,
+    updated_at:   new Date().toISOString(),
+  };
+  if (data.name           !== undefined) payload.name              = data.name;
+  if (data.phone          !== undefined) payload.phone             = data.phone;
+  if (data.photoUrl       !== undefined) payload.photo_url         = data.photoUrl;
+  if (data.bizId          !== undefined) payload.biz_id            = data.bizId;
+  if (data.photoRequested !== undefined) payload.photo_requested   = data.photoRequested;
+  if (data.lastPhotoAskAt !== undefined) payload.last_photo_ask_at = data.lastPhotoAskAt;
+
+  console.log('[SESSION] Attempting upsert:', JSON.stringify(payload));
+
+  const { error } = await supabase
+    .from("triage_sessions")
+    .upsert(payload, { onConflict: "instagram_id" });
+
+  if (error) {
+    console.error("[SESSION] setSession FAILED:", error.message, error.code, error.details);
+  } else {
+    console.log("[SESSION] upsert SUCCESS for:", instagramId);
+  }
+}
+
+async function deleteSession(instagramId: string) {
+  await supabase.from("triage_sessions").delete().eq("instagram_id", instagramId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET — Webhook verification
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function GET(request: NextRequest) {
@@ -269,31 +457,38 @@ export async function GET(request: NextRequest) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST — Main Webhook Handler
+// POST — Main webhook handler
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function POST(req: Request) {
   let senderId = "";
+  let messageSent = false;
 
   try {
-    const body      = await req.json();
+    const body = await req.json();
     const messaging = body?.entry?.[0]?.messaging?.[0];
-
     if (!messaging || messaging.read) return new Response("OK", { status: 200 });
 
-    // ── ECHO HANDLER ─────────────────────────────────────────────────────────
-    // FIX: Only update to DOCTOR_REPLIED when bot is currently WAITING_FOR_DOCTOR.
-    // Old code had no guard — every bot DM echoed back and reset state in a loop.
+    // ── BUSINESS OWNER ──────────────────────────────────────────────────────
+    const recipientId = messaging.recipient?.id ?? "";
+    const { data: bizOwner } = await supabase
+      .from("buisness_owner")
+      .select("id, page_access_token, instagram_id")
+      .eq("instagram_id", recipientId)
+      .maybeSingle();
+    const token = bizOwner?.page_access_token ?? "";
+    const bizId = bizOwner?.id ?? null;
+
+    // ── ECHO ────────────────────────────────────────────────────────────────
     if (messaging.message?.is_echo) {
-      const customerId: string = messaging.recipient?.id ?? "";
-      if (customerId) {
-        const { data: updated } = await supabase
+      if (recipientId) {
+        const { data: upd } = await supabase
           .from("customers")
           .update({ status: "DOCTOR_REPLIED" })
-          .eq("instagram_id", customerId)
+          .eq("instagram_id", recipientId)
           .eq("status", "WAITING_FOR_DOCTOR")
           .select("id");
-        if (updated?.length) console.log(`[ECHO] Doctor replied to ${customerId} → DOCTOR_REPLIED`);
+        if (upd?.length) console.log(`[ECHO] → DOCTOR_REPLIED`);
       }
       return new Response("OK", { status: 200 });
     }
@@ -302,27 +497,170 @@ export async function POST(req: Request) {
     if (!senderId) return new Response("OK", { status: 200 });
 
     const messageId: string | undefined = messaging.message?.mid;
-    const messageText: string           = messaging.message?.text ?? "";
-    const attachments: any[]            = messaging.message?.attachments ?? [];
-    const imageAttachment               = attachments.find((a) => a.type === "image");
-    const audioAttachment               = attachments.find((a) => a.type === "audio");
-    const imageUrl: string | null       = imageAttachment?.payload?.url ?? null;
+    const messageText: string = messaging.message?.text ?? "";
+    const attachments: any[] = messaging.message?.attachments ?? [];
 
-    // ── GUARD: Audio ──────────────────────────────────────────────────────────
-    if (audioAttachment) {
-      await sendInstagramMessage(senderId, "Smahlia, momkin tkteb hit ma imkanich nssm3 l-audio daba 🙏");
+    if (attachments.length > 0)
+      console.log("[ATTACHMENTS]", JSON.stringify(attachments));
+
+    const audioAttachment = attachments.find((a) => a.type === "audio");
+    const hasEphemeral = attachments.some((a) => a.type === "ephemeral");
+    let imageUrl: string | null = extractImageUrl(attachments);
+
+    // Ephemeral → ask to resend from gallery
+    if (hasEphemeral) {
+      await sendDM(
+        senderId,
+        "afak ssiftlina tsswira dyal snank ila kan momkin , 3la limen dyal chacha dyalk atbanlik gallerie clicki eliha o sift tsswira men tema 😊",
+        token
+      );
       return new Response("OK", { status: 200 });
     }
 
-    // ── GUARD: Deduplication ──────────────────────────────────────────────────
-    if (messageId) {
-      try {
-        const { error: dupError } = await supabase.from("processed_messages").insert({ message_id: messageId });
-        if (dupError?.code === "23505") return new Response("OK", { status: 200 });
-      } catch { return new Response("OK", { status: 200 }); }
+    // Audio
+    if (audioAttachment) {
+      await sendDM(
+        senderId,
+        "Smahlia, momkin tkteb hit ma imkanich nssm3 l-audio daba 🙏",
+        token
+      );
+      return new Response("OK", { status: 200 });
     }
 
-    // ── STEP 1: Load profile ──────────────────────────────────────────────────
+    // Try Graph API for image
+    if (!imageUrl && attachments.length > 0 && messageId && token) {
+      const graphUrl = await fetchImageUrlFromGraphAPI(messageId, token);
+      if (graphUrl) imageUrl = graphUrl;
+    }
+
+    if (imageUrl) console.log("[IMAGE URL FOUND]:", imageUrl.substring(0, 80));
+
+    // ── DEDUPLICATION — by messageId AND by content+time ─────────────────────
+    if (messageId) {
+      if (recentlyProcessed.has(messageId)) {
+        console.log('[DEDUP] In-memory skip:', messageId);
+        return new Response("OK", { status: 200 });
+      }
+      recentlyProcessed.add(messageId);
+      setTimeout(() => recentlyProcessed.delete(messageId), 30000);
+      try {
+        const { error: de } = await supabase
+          .from("processed_messages")
+          .insert({ message_id: messageId });
+        if (de?.code === "23505") {
+          console.log('[DEDUP] DB skip:', messageId);
+          return new Response("OK", { status: 200 });
+        }
+      } catch {
+        return new Response("OK", { status: 200 });
+      }
+    }
+
+    // Secondary dedup: same sender + same text/image within 10 seconds
+    const contentToCheck = messageText || (imageUrl ? "[image]" : "");
+    if (contentToCheck) {
+      const tenSecondsAgo = new Date(Date.now() - 10000).toISOString();
+      const { data: recentDup } = await supabase
+        .from("customer_messages")
+        .select("id")
+        .eq("customer_id", senderId)
+        .eq("message_text", contentToCheck)
+        .gte("timestamp", tenSecondsAgo)
+        .maybeSingle();
+
+      if (recentDup) {
+        console.log('[DEDUP] Content+time duplicate — skipping:', contentToCheck);
+        return new Response("OK", { status: 200 });
+      }
+    }
+
+    // ── PRE-LOAD STATUS — needed to decide whether to buffer ─────────────────
+    const { data: statusRow } = await supabase
+      .from("customers")
+      .select("status")
+      .eq("instagram_id", senderId)
+      .maybeSingle();
+    const currentStatus = statusRow?.status as BotStatus | null;
+
+    // These statuses need immediate handling — never buffer them
+    const bypassBuffer =
+      currentStatus === "WAITING_FOR_CONSENT" ||
+      currentStatus === "WAITING_FOR_APPOINTMENT_INTENT" ||
+      currentStatus === "WAITING_FOR_DOCTOR" ||
+      currentStatus === "ARCHIVED";
+
+    // ── TYPING WINDOW ────────────────────────────────────────────────────────
+    // Insert AFTER deduplication — only non-duplicate messages enter the buffer
+    if (messageText || imageUrl) {
+      await supabase.from("pending_messages").insert({
+        instagram_id: senderId,
+        message_text: messageText || (imageUrl ? "[image]" : ""),
+        message_id: messageId ?? null,
+        processed: false,
+      });
+    }
+
+    // Only look at messages from the last 10 seconds
+    const windowStart = new Date(Date.now() - 10000).toISOString();
+
+    const { data: pendingMsgs } = await supabase
+      .from("pending_messages")
+      .select("id, message_text, created_at")
+      .eq("instagram_id", senderId)
+      .eq("processed", false)
+      .gte("created_at", windowStart)
+      .order("created_at", { ascending: true });
+
+    const firstTime = pendingMsgs?.[0]?.created_at
+      ? new Date(pendingMsgs[0].created_at)
+      : new Date();
+    const secondsWaited = (Date.now() - firstTime.getTime()) / 1000;
+
+    // Only buffer if there are MULTIPLE messages being sent rapidly
+    // Single messages are processed immediately
+    // Multiple messages within 8s are batched together
+    const messageCount = pendingMsgs?.length ?? 0;
+
+    if (!bypassBuffer && messageCount > 1 && secondsWaited < 8) {
+      console.log(
+        `[WINDOW] Buffering ${Math.round(8 - secondsWaited)}s left. Count: ${messageCount}`
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    // Mark all as processed
+    await supabase
+      .from("pending_messages")
+      .update({ processed: true })
+      .eq("instagram_id", senderId)
+      .eq("processed", false);
+
+    // Clean up old messages older than 5 minutes
+    await supabase
+      .from("pending_messages")
+      .delete()
+      .eq("instagram_id", senderId)
+      .lt("created_at", new Date(Date.now() - 300000).toISOString());
+
+    if (!pendingMsgs || pendingMsgs.length === 0) {
+      console.log("[WINDOW] No pending messages — skipping");
+      return new Response("OK", { status: 200 });
+    }
+
+    const allPendingText = (pendingMsgs ?? [])
+      .map((m: any) => m.message_text)
+      .filter((m: any) => m && m !== "[image]")
+      .join(" | ");
+    const hasImageInPending = (pendingMsgs ?? []).some(
+      (m: any) => m.message_text === "[image]"
+    );
+    const combinedText = allPendingText || messageText;
+
+    console.log(
+      `[WINDOW] Processing ${pendingMsgs?.length} msgs: "${allPendingText}"`
+    );
+
+    // ── LOAD PROFILE ─────────────────────────────────────────────────────────
     const { data: rawProfile } = await supabase
       .from("customers")
       .select("name, first_name, last_name, phone, has_photo, last_dental_image, status")
@@ -341,113 +679,362 @@ export async function POST(req: Request) {
 
     console.log(`[WEBHOOK] sender=${senderId} status=${profile.status}`);
 
-    // ── GUARD: Waiting for doctor ─────────────────────────────────────────────
+    // ── WELCOME ──────────────────────────────────────────────────────────────
+    if (!rawProfile) {
+      const intentPrompt = `A patient just sent their first message to a dental clinic Instagram account.
+
+Analyse their message and respond with JSON only:
+{
+  "intent": "PRICE_ONLY" or "WANTS_APPOINTMENT" or "GENERAL_INTEREST",
+  "reply": "your natural Darija response"
+}
+
+PRICE_ONLY = they only ask about price/cost with no booking interest (ch7al, combien, prix, tarif, ch7al kaytswab)
+WANTS_APPOINTMENT = they want to book, have a dental problem, say salam/mrhba showing they want help
+GENERAL_INTEREST = anything else — treat as interested
+
+If PRICE_ONLY: answer price in Darija, then add: "ila bghiti dir rdv tbib ghay3ytlik 😊"
+If WANTS_APPOINTMENT or GENERAL_INTEREST: reply = "" — welcome message handles it
+
+Prices: Détartrage 300DH | Plombage 400DH | Extraction 200DH | Blanchiment 500DH
+
+Patient message: "${combinedText || messageText}"`;
+
+      try {
+        const intentRaw = await callClaudeHaiku(
+          intentPrompt,
+          combinedText || messageText || ""
+        );
+        const is = intentRaw.indexOf("{");
+        const ie = intentRaw.lastIndexOf("}");
+        const intentParsed = JSON.parse(intentRaw.substring(is, ie + 1));
+        if (intentParsed.intent === "PRICE_ONLY") {
+          console.log("[INTENT] Price-only — not saving to DB");
+          await sendDM(senderId, intentParsed.reply, token);
+          return new Response("OK", { status: 200 });
+        }
+      } catch (err) {
+        console.error("[INTENT] Error:", err);
+      }
+
+      const welcomeMsg = `Salam 😊 Mrhba bik f cabinet dyalna!\n\nGhadi nsswlok 3 ass2ila bssita bach nakhdo les infos li khassina — ghadi takhod ghir dqiqa mn we9tk.\n\nMn ba3d, tbib ghay3ytlik b appel bach dir consultation gratuite`;
+      const { error: insertErr } = await supabase.from("customers").insert({
+        instagram_id:      senderId,
+        status:            "WAITING_FOR_CONSENT",
+        has_photo:         false,
+        intent:            "interested",
+        last_seen_at:      new Date().toISOString(),
+        business_owner_id: bizId,
+      });
+      if (insertErr) {
+        console.error("[WELCOME] Insert failed:", insertErr.message);
+        const { data: ex } = await supabase
+          .from("customers")
+          .select("status")
+          .eq("instagram_id", senderId)
+          .maybeSingle();
+        if (!ex) {
+          console.error("[WELCOME] Cannot create row");
+          return new Response("OK", { status: 200 });
+        }
+      } else {
+        await sendDM(senderId, welcomeMsg, token);
+        await saveMsgHistory(
+          senderId,
+          combinedText || "(first message)",
+          welcomeMsg,
+          bizId
+        );
+        console.log("[WELCOME] Sent to:", senderId);
+        return new Response("OK", { status: 200 });
+      }
+    }
+
+    // ── STATUS GUARDS ────────────────────────────────────────────────────────
     if (profile.status === "WAITING_FOR_DOCTOR") {
-      console.log(`[PAUSE] ${senderId} waiting for doctor. Silent.`);
+      console.log(`[PAUSE] Silent.`);
+      return new Response("OK", { status: 200 });
+    }
+    if (profile.status === "ARCHIVED") {
+      console.log(`[ARCHIVED] Silent.`);
       return new Response("OK", { status: 200 });
     }
 
-    // ── CONTEXT: Doctor just replied ──────────────────────────────────────────
+    // ── APPOINTMENT INTENT ───────────────────────────────────────────────────
+    if (profile.status === "WAITING_FOR_APPOINTMENT_INTENT") {
+      const intentPrompt = `The patient was asked if they want to book an appointment soon or just wanted info.
+Question: "wach baghi ta5ed chi rendez fhad l ayam ola bghit t3ref ghi latmina?"
+
+JSON only: { "intent": "YES" or "NO" or "UNCLEAR" }
+
+YES = iyeh, wakha, bghit, oui, yes, ewa, daba, fhad layam, bghit ndir, mzyan, yallah, ah, waw
+NO = la, non, mazal, machi daba, bghit t3ref ghi, latmina, later, mabaghitch, machi
+UNCLEAR = anything else → treat as YES
+
+Patient reply: "${combinedText || messageText}"`;
+
+      try {
+        const raw = await callClaudeHaiku(
+          intentPrompt,
+          combinedText || messageText || ""
+        );
+        const s = raw.indexOf("{");
+        const e = raw.lastIndexOf("}");
+        const parsed = JSON.parse(raw.substring(s, e + 1));
+
+        if (parsed.intent === "NO") {
+          const thankMsg =
+            "ayeh marhba bik fay w9ita, hena kaynin 😊 ila bghiti chi haja men ba3d ma t9essrch!";
+          await sendDM(senderId, thankMsg, token);
+          await supabase.from("customer_messages").delete().eq("customer_id", senderId);
+          await supabase.from("pending_messages").delete().eq("instagram_id", senderId);
+          await supabase.from("customers").delete().eq("instagram_id", senderId);
+          await deleteSession(senderId);
+          console.log("[SESSION] Deleted — no appointment intent");
+          return new Response("OK", { status: 200 });
+        } else {
+          const apptSession = await getSession(senderId);
+          if (apptSession) {
+            await supabase.from("customers").upsert(
+              {
+                instagram_id:      senderId,
+                name:              apptSession.name,
+                first_name:        apptSession.name?.split(" ")[0] ?? null,
+                last_name:         apptSession.name?.split(" ").slice(1).join(" ") || null,
+                phone:             apptSession.phone,
+                has_photo:         !!apptSession.photo_url,
+                last_dental_image: apptSession.photo_url,
+                status:            "WAITING_FOR_DOCTOR",
+                last_seen_at:      new Date().toISOString(),
+                business_owner_id: apptSession.biz_id,
+              },
+              { onConflict: "instagram_id" }
+            );
+            await deleteSession(senderId);
+            console.log("[SESSION] Committed to DB");
+          } else {
+            await supabase
+              .from("customers")
+              .update({ status: "WAITING_FOR_DOCTOR" })
+              .eq("instagram_id", senderId);
+          }
+          const bookMsg = "Tbib ghaychof dossier dyalk o ghaycontactik daba chwya 😊";
+          await sendDM(senderId, bookMsg, token);
+          await saveMsgHistory(
+            senderId,
+            combinedText || messageText || "",
+            bookMsg,
+            bizId
+          );
+          return new Response("OK", { status: 200 });
+        }
+      } catch (err) {
+        console.error("[APPOINTMENT INTENT] Error:", err);
+        const bookMsg = "Tbib ghaychof dossier dyalk o ghaycontactik daba chwya 😊";
+        await sendDM(senderId, bookMsg, token);
+        await supabase
+          .from("customers")
+          .update({ status: "WAITING_FOR_DOCTOR" })
+          .eq("instagram_id", senderId);
+        return new Response("OK", { status: 200 });
+      }
+    }
+
+    // ── CONSENT ──────────────────────────────────────────────────────────────
+    if (profile.status === "WAITING_FOR_CONSENT") {
+      const consentPrompt = `Analyse a reply from a patient who received a dental clinic welcome message.
+
+JSON only: { "intent": "YES" or "NO" or "UNCLEAR" }
+
+YES = wakha, ewa, ayeh, oui, ok, mrhba, inchallah, mzyan, waw, sure, yes, d'accord, parfait
+NO = la, non, no, mabghitch, machi, later, machi daba
+UNCLEAR = anything else
+
+Patient message: "${combinedText || messageText}"`;
+
+      try {
+        const raw = await callClaudeHaiku(consentPrompt, combinedText || messageText);
+        const s = raw.indexOf("{");
+        const e = raw.lastIndexOf("}");
+        const parsed = JSON.parse(raw.substring(s, e + 1));
+
+        if (parsed.intent === "NO") {
+          const { data: biz } = await supabase
+            .from("buisness_owner")
+            .select("phone")
+            .eq("id", bizId)
+            .maybeSingle();
+          const doctorPhone = biz?.phone ?? "+212XXXXXXXXX";
+          const noMsg = `Machi mochkil 😊 Hahowa numero dyal docteur ila bghiti tcalled m3ah nichan: ${doctorPhone}`;
+          await sendDM(senderId, noMsg, token);
+          await supabase
+            .from("customers")
+            .update({ status: "ARCHIVED" })
+            .eq("instagram_id", senderId);
+          await saveMsgHistory(senderId, combinedText || messageText, noMsg, bizId);
+          return new Response("OK", { status: 200 });
+        } else {
+          await supabase
+            .from("customers")
+            .update({ status: "BOT_ACTIVE" })
+            .eq("instagram_id", senderId);
+
+          const startPrompt = `You are Nour, a warm receptionist for a Moroccan dental clinic on Instagram.
+You speak natural Moroccan Darija mixed with French — like a real person texting on WhatsApp.
+
+The patient just agreed to answer a few questions.
+Their message: "${combinedText || messageText}"
+
+Warmly acknowledge them and naturally ask for their full name (first and last).
+Be human, short, natural. Max 1-2 sentences. 1 emoji max.
+
+JSON only: { "reply": "your warm Darija message asking for their name" }`;
+
+          try {
+            const sr = await callClaude(startPrompt, combinedText || messageText);
+            const ss = sr.indexOf("{");
+            const ee = sr.lastIndexOf("}");
+            const sp = JSON.parse(sr.substring(ss, ee + 1));
+            const askMsg = sp.reply?.trim() ?? "Bzaf mzyan 😊 Smiytek kamla afak?";
+            await sendDM(senderId, askMsg, token);
+            await saveMsgHistory(senderId, combinedText || messageText, askMsg, bizId);
+          } catch {
+            const fallback = "Bzaf mzyan 😊 Smiytek kamla afak?";
+            await sendDM(senderId, fallback, token);
+            await saveMsgHistory(senderId, combinedText || messageText, fallback, bizId);
+          }
+          return new Response("OK", { status: 200 });
+        }
+      } catch (err) {
+        console.error("[CONSENT] Error:", err);
+        await supabase
+          .from("customers")
+          .update({ status: "BOT_ACTIVE" })
+          .eq("instagram_id", senderId);
+        const fallback = "Bzaf mzyan 😊 Smiytek kamla afak?";
+        await sendDM(senderId, fallback, token);
+        return new Response("OK", { status: 200 });
+      }
+    }
+
+    // ── DOCTOR REPLIED ────────────────────────────────────────────────────────
     const doctorJustReplied = profile.status === "DOCTOR_REPLIED";
     if (doctorJustReplied) {
-      await supabase.from("customers").update({ status: "BOT_ACTIVE" }).eq("instagram_id", senderId);
-      console.log(`[CONTEXT] Doctor replied → post-triage mode`);
+      await supabase
+        .from("customers")
+        .update({ status: "BOT_ACTIVE" })
+        .eq("instagram_id", senderId);
+      console.log(`[CONTEXT] Doctor replied → post-triage`);
     }
 
-    // ── STEP 2: Extract from raw message ─────────────────────────────────────
-    const intent      = detectIntent(messageText, imageUrl);
-    const msgPhone    = extractPhoneFromText(messageText);
-    const msgName     = extractNameFromText(messageText);
-    const msgDay      = extractDayFromText(messageText);
-    const msgTime     = extractTimeFromText(messageText);
-    const mergedPhone = msgPhone ?? profile.phone;
-    const mergedName  = msgName ?? (
-      profile.first_name ? `${profile.first_name} ${profile.last_name ?? ""}`.trim() : profile.name
-    );
+    // ── EXTRACT ───────────────────────────────────────────────────────────────
+    // If this is an image message, don't try to extract
+    // name/phone from old buffered text — use session only
+    const isImageOnlyMessage = !!imageUrl && !messageText;
+    const msgPhone = isImageOnlyMessage ? null : extractPhoneFromText(combinedText);
+    const msgName  = isImageOnlyMessage ? null : extractNameFromText(combinedText);
+    const msgDay   = extractDayFromText(combinedText);
+    const msgTime  = extractTimeFromText(combinedText);
 
-    // ── STEP 3: Save photo if arrived ────────────────────────────────────────
+    const session = await getSession(senderId);
+    const mergedPhone = msgPhone ?? profile.phone ?? session?.phone ?? null;
+    const mergedName =
+      msgName ??
+      (profile.first_name
+        ? `${profile.first_name} ${profile.last_name ?? ""}`.trim()
+        : profile.name) ??
+      session?.name ??    // session fetched at start of flow
+      null;
+    // Note: freshSession (fetched after photo processing) is used as additional
+    // fallback in the photo completion block below for when image arrives
+
+    // ── PHOTO — mark in session IMMEDIATELY before any other logic ─────────
     let savedImageUrl: string | null = null;
-    if (imageUrl) {
-      savedImageUrl = await saveDentalPhoto(imageUrl, senderId);
-      if (!savedImageUrl) savedImageUrl = imageUrl;
+
+    // CRITICAL: If image is detected, immediately clear photo_requested flag
+    // This prevents any logic from asking for the photo again
+    if (imageUrl || hasImageInPending) {
+      await setSession(senderId, { photoRequested: false });
     }
 
-    const finalImage = savedImageUrl ?? profile.last_dental_image;
-    const hasPhoto   = profile.has_photo || !!savedImageUrl;
-    const hasName    = !!mergedName;
-    const hasPhone   = !!mergedPhone;
+    if (imageUrl) {
+      const uploaded = await saveDentalPhoto(imageUrl, senderId, token);
+      if (uploaded) {
+        savedImageUrl = uploaded;
+        // Save photo URL and confirm photo is no longer needed
+        await setSession(senderId, {
+          photoUrl:        savedImageUrl,
+          photoRequested:  false,
+          lastPhotoAskAt:  null,
+        });
+        console.log(`[PHOTO] Saved: ${savedImageUrl}`);
+      }
+    }
 
-    // ── STEP 4: Determine mode ────────────────────────────────────────────────
-    const wasComplete  = !!((profile.name || profile.first_name) && profile.phone && profile.has_photo);
+    // Re-fetch session after photo update to get latest state
+    const freshSession = await getSession(senderId);
+
+    const hasPhoto =
+      profile.has_photo ||
+      !!savedImageUrl ||
+      !!freshSession?.photo_url;
+    const hasName  = !!mergedName;
+    const hasPhone = !!mergedPhone;
+
+    // ── MODE ──────────────────────────────────────────────────────────────────
+    const wasComplete =
+      !!((profile.name || profile.first_name) && profile.phone && profile.has_photo);
     const isPostTriage = wasComplete || doctorJustReplied;
 
-    console.log(`[MODE] wasComplete=${wasComplete} isPostTriage=${isPostTriage} doctorJustReplied=${doctorJustReplied}`);
+    console.log(`[MODE] wasComplete=${wasComplete} isPostTriage=${isPostTriage}`);
 
-    // ── STEP 5: Missing triage items ─────────────────────────────────────────
-    const missing: string[] = [];
-    if (!hasName)  missing.push("nom complet");
-    if (!hasPhone) missing.push("numéro de téléphone");
-    if (!hasPhoto) missing.push("photo claire des dents");
-
-    const infoStatus = [
-      `Nom: ${hasName  ? `✓ (${mergedName})`  : "✗ MANQUANT"}`,
-      `Tél: ${hasPhone ? `✓ (${mergedPhone})` : "✗ MANQUANT"}`,
-      `Photo: ${hasPhoto ? "✓ REÇUE"          : "✗ MANQUANTE"}`,
-    ].join(" | ");
-
-    // ── STEP 6: Call AI ───────────────────────────────────────────────────────
-    let aiReply       = "";
+    // ── AI ────────────────────────────────────────────────────────────────────
+    let aiReply  = "";
     let aiName:  string | null = null;
     let aiPhone: string | null = null;
     let aiDay:   string | null = null;
     let aiTime:  string | null = null;
 
     if (isPostTriage) {
-      // ── POST-TRIAGE: normal conversation + booking ──────────────────────────
+      // ── POST-TRIAGE: booking conversation ──────────────────────────────────
       const availableSlots = await getAvailableSlots();
-
       const eventCtx = doctorJustReplied
-        ? `Le médecin vient de répondre. Premier message du patient: "${messageText || "(pas de texte)"}"`
-        : `Message du patient: "${messageText || "(pas de texte)"}"`;
+        ? `Doctor just replied. Patient's first message: "${combinedText || "(no text)"}"`
+        : `Patient sent: "${combinedText || "(no text)"}"`;
 
-      const postTriagePrompt = `Tu es Nour, l'assistante professionnelle d'un cabinet dentaire marocain.
-Tu réponds en Darija marocaine naturelle + français, comme parlent les Marocains.
+      const postTriagePrompt = `You are a smart and warm Moroccan dental clinic assistant on Instagram DM.
+You speak natural Moroccan Darija mixed with French — like a real receptionist on WhatsApp.
 
-DOSSIER PATIENT:
-• Nom: ${mergedName ?? "inconnu"} | Tél: ${mergedPhone ?? "inconnu"}
-• Statut: Consultation terminée ✅ — ${doctorJustReplied ? "médecin vient de répondre" : "médecin a déjà répondu"}
+PATIENT: ${mergedName ?? "unknown"} | Phone: ${mergedPhone ?? "unknown"}
+STATUS: Triage complete ✅ — ${doctorJustReplied ? "doctor just replied" : "doctor already replied"}
 
-CRÉNEAUX DISPONIBLES (données réelles):
+AVAILABLE SLOTS (internal — never list all at once):
 ${availableSlots}
 
-JOUR/HEURE MENTIONNÉS DANS CE MESSAGE (détectés automatiquement):
-• Jour: ${msgDay ? (DAY_LABEL[msgDay] ?? msgDay) : "non détecté"}
-• Heure: ${msgTime ? (TIME_LABEL[msgTime] ?? msgTime) : "non détectée"}
+AUTO-DETECTED:
+- Day: ${msgDay ? (DAY_LABEL[msgDay] ?? msgDay) : "not detected"}
+- Time: ${msgTime ? (TIME_LABEL[msgTime] ?? msgTime) : "not detected"}
 
-RÔLE:
-• Répondre naturellement aux questions du patient
-• Si le patient veut réserver: proposer des créneaux UNIQUEMENT depuis la liste ci-dessus
-• Si le patient mentionne un jour ET une heure disponibles: confirme et indique que tu vas réserver
-• Si le créneau demandé n'est pas dans la liste: dis poliment qu'il n'est pas disponible et propose des alternatives
+YOUR ROLE:
+- Listen naturally and respond like a real person
+- If patient asks about availability: ask what time works for them
+- If patient proposes available time: confirm warmly
+- If NOT available: apologize and suggest nearest alternative
+- Max 2 sentences. Natural Darija. 1 emoji max.
 
-RÈGLES:
-• NE PAS redemander photo, nom, téléphone — déjà collectés ✅
-• NE PAS inventer des disponibilités — utiliser UNIQUEMENT la liste ci-dessus
-• MAX 3 phrases. Professionnel et chaleureux.
-
-FORMAT JSON uniquement:
+JSON only:
 {
-  "reply": "message en Darija",
+  "reply": "your natural Darija response",
   "extracted": {
     "full_name": null,
     "phone": null,
-    "booking_day": "code du jour (Mon/Tue/Wed/Thu/Fri/Sat/Sun) ou null",
-    "booking_time": "code heure (9a/11a/1p/3p/4p/5p) ou null"
+    "booking_day": "day code or null",
+    "booking_time": "time code or null"
   }
 }`;
 
       try {
-        const rawText = await callGemini(postTriagePrompt, eventCtx);
+        const rawText = await callClaude(postTriagePrompt, eventCtx);
         const s = rawText.indexOf("{");
         const e = rawText.lastIndexOf("}");
         if (s === -1 || e === -1) throw new Error("No JSON");
@@ -457,51 +1044,174 @@ FORMAT JSON uniquement:
         aiTime  = parsed.extracted?.booking_time?.trim() || null;
       } catch (err) {
         console.error("[AI POST-TRIAGE ERROR]:", err);
-        aiReply = "Smahlia chwia, kayn chi 3otla sa3a. Rja3 liya men ba3d dqiqa 🙏";
+        aiReply = "Smahlia chwia, kayn chi 3otla. Rja3 liya men ba3d dqiqa 🙏";
       }
-
     } else {
-      // ── TRIAGE MODE ─────────────────────────────────────────────────────────
-      let eventDescription: string;
-      switch (intent) {
-        case "NEW_PHOTO":
-          eventDescription = missing.length === 0
-            ? `[PHOTO REÇUE. Triage complet. Informe le patient que le médecin va l'examiner et le contacter.]`
-            : `[PHOTO REÇUE${messageText ? ` caption: "${messageText}"` : ""}. Remercie chaleureusement. Demande UNE SEULE chose: "${missing[0]}". Ne demande pas encore: ${missing.slice(1).join(", ") || "rien d'autre"}.]`;
-          break;
-        case "ASKING_QUESTION":
-          eventDescription = `[QUESTION]: "${messageText}"\nRéponds D'ABORD. ${missing.length > 0 ? `Ensuite demande UNE SEULE chose: "${missing[0]}".` : "Tout est complet."}`;
-          break;
-        default:
-          eventDescription = missing.length > 0
-            ? `Message: "${messageText || "(vide)"}"\nProchaine info: "${missing[0]}". Ne demande PAS: ${missing.slice(1).join(", ") || "rien"}.`
-            : `Message: "${messageText || "(vide)"}". Triage complet — confirme que le médecin va contacter le patient.`;
+      // ── TRIAGE ───────────────────────────────────────────────────────────
+
+      // Photo just arrived + name + phone = complete — ask appointment intent
+      const latestSess = await getSession(senderId);
+      const effectiveName  = mergedName  || latestSess?.name  || freshSession?.name  || null;
+      const effectivePhone = mergedPhone || latestSess?.phone || freshSession?.phone || null;
+      const effectivePhoto = savedImageUrl        ?? freshSession?.photo_url ?? null;
+
+      if (savedImageUrl && effectiveName && effectivePhone) {
+        // All 3 collected — save to session and ask appointment intent
+        await setSession(senderId, {
+          name:            effectiveName,
+          phone:           effectivePhone,
+          photoUrl:        savedImageUrl,
+          photoRequested:  false,
+          lastPhotoAskAt:  null,
+          bizId,
+        });
+        const intentMsg =
+          "wach baghi ta5ed chi rendez fhad l ayam ola bghit t3ref ghi latmina? 😊";
+        await supabase
+          .from("customers")
+          .update({ status: "WAITING_FOR_APPOINTMENT_INTENT" })
+          .eq("instagram_id", senderId);
+        await sendDM(senderId, intentMsg, token);
+        await saveMsgHistory(senderId, "[image]", intentMsg, bizId);
+        return new Response("OK", { status: 200 });
       }
 
-      const triagePrompt = `Tu es Nour, assistante d'un cabinet dentaire marocain. Darija naturelle + français.
-STYLE: Chaleureux, MAX 2 phrases, emojis modérés 😊 🙏
-OBJECTIF: Collecter 1) Photo dents 2) Nom complet 3) Téléphone
-ÉTAT: ${infoStatus}
-RÈGLES: Réponds d'abord aux questions. Un seul élément par message. Ne redemande jamais ce qui est coché (✓).
-Tarifs: Détartrage 300DH | Plombage 400DH | Extraction 200DH | Blanchiment 500DH.
-FORMAT JSON: {"reply":"...","extracted":{"full_name":"...","phone":"...","booking_day":null,"booking_time":null}}`;
-
-      try {
-        const rawText = await callGemini(triagePrompt, eventDescription);
-        const s = rawText.indexOf("{");
-        const e = rawText.lastIndexOf("}");
-        if (s === -1 || e === -1) throw new Error("No JSON");
-        const parsed: AIExtracted = JSON.parse(rawText.substring(s, e + 1));
-        aiReply = parsed.reply?.trim() ?? "";
-        aiName  = parsed.extracted?.full_name?.trim()  || null;
-        aiPhone = parsed.extracted?.phone?.trim()      || null;
-      } catch (err) {
-        console.error("[AI TRIAGE ERROR]:", err);
-        aiReply = "Smahlia chwia, kayn chi 3otla sa3a. Rja3 liya men ba3d dqiqa 🙏";
+      // Declined photo
+      const declined =
+        /mandi\s*ha|ma\s*3ndi|makanitsh|makantch|machi\s*3ndi|bla\s*photo|sans\s*photo/i.test(
+          combinedText
+        );
+      if (declined && hasName && hasPhone) {
+        const msg = `Machi mochkil 😊 Tbib ghay3ytlik f ${mergedPhone} daba chwya o swwlo libghiti`;
+        await supabase
+          .from("customers")
+          .update({ status: "WAITING_FOR_DOCTOR" })
+          .eq("instagram_id", senderId);
+        await sendDM(senderId, msg, token);
+        await saveMsgHistory(senderId, combinedText, msg, bizId);
+        return new Response("OK", { status: 200 });
       }
+
+      const alreadyComplete = !!mergedName && !!mergedPhone && hasPhoto;
+
+      // Check if photo was already requested recently (15s cooldown)
+      const photoAskedRecently =
+        freshSession?.photo_requested === true &&
+        freshSession?.last_photo_ask_at != null &&
+        Date.now() - new Date(freshSession.last_photo_ask_at).getTime() < 15000;
+
+      if (!alreadyComplete && !hasImageInPending && !photoAskedRecently) {
+        // Load history
+        const { data: msgHistory } = await supabase
+          .from("customer_messages")
+          .select("message_text, reply_text, timestamp")
+          .eq("customer_id", senderId)
+          .order("timestamp", { ascending: true })
+          .limit(15);
+        const historyLines = (msgHistory ?? [])
+          .flatMap((m: any) => [
+            m.message_text ? `Patient: ${m.message_text}` : "",
+            m.reply_text   ? `Nour: ${m.reply_text}`   : "",
+          ])
+          .filter(Boolean)
+          .join("\n");
+
+        const triageSystemPrompt = `Nta Nour, receptionniste f cabinet dentaire f Maroc — katktb 3la Instagram DM.
+Darktek 100% darija maghribia hqiqa — bhal shi wahda katktb f WhatsApp m3a sah7tha.
+Machi robot, machi formel — bnadem 3adi li kaytklm b7al-ma kaytklm nass.
+
+MA 3NDEK 3LIH DABA (had l-ma3lumat confirmed — thq fihom aktar mn l-historique):
+- Isem: ${mergedName ? `✅ COLLECTED → ${mergedName} — NEVER ask for name again` : "❌ MISSING — ask for name"}
+- Tel: ${mergedPhone ? `✅ COLLECTED → ${mergedPhone} — NEVER ask for phone again` : "❌ MISSING — ask for phone"}
+- Tsswira: ${hasPhoto ? "✅ RECEIVED — NEVER ask for photo again" : "❌ MISSING — ask for photo"}
+- Next step: ${!mergedName ? "ASK FOR NAME ONLY" : !mergedPhone ? "ASK FOR PHONE ONLY" : !hasPhoto ? "ASK FOR PHOTO ONLY" : "ALL COLLECTED"}
+
+CRITICAL RULE: The state above is the ABSOLUTE truth.
+Even if the conversation history shows otherwise,
+ALWAYS trust the state above. Never ask for something
+already marked ✅.
+
+DYAL LI DAR HADI:
+${historyLines || "Ma kayn historique — rkz 3la l-state li fo9 bash t3rf fin nta f conversation"}
+
+LI MAZAL KHASSEK T3RF (b had t-tartib, wahd wahd):
+${!mergedName  ? "→ Ismoh kamil (isem u lqab)" : ""}
+${!mergedPhone ? "→ Rqm dyal telephone"        : ""}
+${!hasPhoto    ? "→ Tsswira dyal snano (men galerie, machi story wla post)" : ""}
+
+KAYFIYTEK:
+- Katjawb 3la ay so2al qbl ma tkml
+- 3mrk ma tsowl 3la shi khssek m3ndo deja
+- Katkhraj lisem u tilifon b 7al tabi3i
+- Itaw3 lslob dyalo
+
+TARIFS (ghir ila so2al):
+- Détartrage: 300 DH | Plombage: 400 DH | Extraction: 200 DH | Blanchiment: 500 DH
+- Consultation: m9abla b tilifon m3a tbib — blash
+
+ILA KAMLU LES 3:
+"Wakha [isem]! Dossier dyalk wajed ✅ Tbib ghay3ytlik f [tel] daba chwiya 😊"
+
+EXTRACTION:
+- "ana Karim Benali" / "Karim Benali" → full_name: "Karim Benali"
+- "0661234567" / "+212661234567" → phone: "0661234567"
+- "ayeh", "wakha", "ewa", "oui", "mrhba", "bien sur" → affirmations, MACHI isem → full_name: null
+
+JSON ghir — walo akhr:
+{
+  "reply": "darktek f darija",
+  "extracted": {
+    "full_name": "isem kamil wla null",
+    "phone": "rqm wla null",
+    "has_photo": false
+  }
+}`;
+
+        const userContext = `Patient messages (buffered — treat as one turn):
+"${combinedText || "(image received)"}"`;
+
+        try {
+          const rawText = await callClaude(triageSystemPrompt, userContext);
+          const s = rawText.indexOf("{");
+          const e = rawText.lastIndexOf("}");
+          if (s === -1 || e === -1) throw new Error("No JSON");
+          const parsed = JSON.parse(rawText.substring(s, e + 1));
+          aiReply = parsed.reply?.trim() ?? "";
+
+          // If Claude is asking for photo, set the flag to prevent repeating
+          const isAskingForPhoto =
+            aiReply.includes("tsswira") ||
+            aiReply.includes("galerie")  ||
+            aiReply.includes("snano")    ||
+            aiReply.includes("snank");
+
+          if (isAskingForPhoto && !hasPhoto) {
+            await setSession(senderId, {
+              photoRequested:  true,
+              lastPhotoAskAt:  new Date().toISOString(),
+            });
+            console.log("[SESSION] Photo request flagged");
+          }
+
+          const rawAiName = parsed.extracted?.full_name?.trim() || null;
+          aiName  = rawAiName && isValidHumanName(rawAiName) ? rawAiName : null;
+          if (rawAiName && !aiName) console.log("[NAME REJECTED]", rawAiName);
+          if (aiName) {
+            await setSession(senderId, { name: aiName });
+            console.log('[SESSION] Name saved from AI:', aiName);
+          }
+          aiPhone = parsed.extracted?.phone?.trim() || null;
+        } catch (err) {
+          console.error("[AI TRIAGE ERROR]:", err);
+          if (!hasName)       aiReply = "Smiytek kamla afak? 😊";
+          else if (!hasPhone) aiReply = `Mzyan ${mergedName} 👍 R9m dyal portable dyalk?`;
+          else                aiReply = "3tina tsswira dyal snank — doz 3la icon galerie f Instagram 😊";
+        }
+      }
+      // If photoAskedRecently is true and no image arrived → stay silent
     }
 
-    // ── STEP 7: Merge extracted data ──────────────────────────────────────────
+    // ── MERGE DATA ────────────────────────────────────────────────────────────
     let finalName:      string | null = profile.name       ?? null;
     let finalFirstName: string | null = profile.first_name ?? null;
     let finalLastName:  string | null = profile.last_name  ?? null;
@@ -509,120 +1219,148 @@ FORMAT JSON: {"reply":"...","extracted":{"full_name":"...","phone":"...","bookin
     const nameToUse = mergedName || aiName;
     if (nameToUse && !(profile.name || profile.first_name)) {
       finalName = nameToUse;
-      const parts    = finalName.split(/\s+/);
-      finalFirstName = parts[0]                 ?? null;
+      const parts = (finalName ?? "").split(/\s+/);
+      finalFirstName = parts[0] ?? null;
       finalLastName  = parts.slice(1).join(" ") || null;
     }
 
     const finalPhone = mergedPhone ?? aiPhone ?? null;
+    const finalDay   = msgDay ?? aiDay  ?? null;
+    const finalTime  = msgTime ?? aiTime ?? null;
 
-    // Day/time: message text wins over AI extracted (regex is more reliable)
-    const finalDay  = msgDay  ?? aiDay  ?? null;
-    const finalTime = msgTime ?? aiTime ?? null;
+    // ── DECIDE REPLY ──────────────────────────────────────────────────────────
+    const isNowComplete =
+      !!((finalName || finalFirstName) && finalPhone && hasPhoto);
+    let replyText: string;
+    let finalStatus: BotStatus = doctorJustReplied
+      ? "BOT_ACTIVE"
+      : profile.status;
 
-    // ── STEP 8: Re-check triage completion ───────────────────────────────────
-    const isNowComplete = !!((finalName || finalFirstName) && finalPhone && (hasPhoto || !!finalImage));
-
-    // ── STEP 9: Decide reply + status ─────────────────────────────────────────
-    let replyText:   string;
-    let finalStatus: BotStatus = doctorJustReplied ? "BOT_ACTIVE" : profile.status;
-
-    if (isNowComplete && !wasComplete && !isPostTriage) {
-      // Triage just completed → hand off, go silent
-      replyText   = "Mzyan bzaf! L-médecin ghadi ichouf dossier dyalk w ghadi icontactik daba chwya 😊 Chokran 3la thiqa!";
+    if (isNowComplete && !wasComplete && !isPostTriage && !savedImageUrl) {
+      replyText   = `Tbib ghay3ytlik daba chwya bach y3tik les détails 😊`;
       finalStatus = "WAITING_FOR_DOCTOR";
-      console.log(`[HANDOFF] ${senderId} → WAITING_FOR_DOCTOR`);
-
+      console.log(`[HANDOFF] → WAITING_FOR_DOCTOR`);
     } else if (isPostTriage && finalDay && finalTime) {
-      // ── BOOKING ATTEMPT ────────────────────────────────────────────────────
-      // Patient mentioned a day + time in post-triage mode → try to book it
       const bookingResult = await bookSlot(finalDay, finalTime, senderId, finalName);
       if (bookingResult) {
         replyText = bookingResult;
-        console.log(`[BOOKING] Confirmed: ${finalDay} ${finalTime} for ${senderId}`);
+        console.log(`[BOOKING] ✅ ${finalDay} ${finalTime}`);
       } else {
-        // Slot not available — get fresh list and offer alternatives
         const freshSlots = await getAvailableSlots();
-        replyText = `Smahlia, nhar ${DAY_LABEL[finalDay] ?? finalDay} m3a ${TIME_LABEL[finalTime] ?? finalTime} machi disponible. Créneaux disponibles:\n${freshSlots}`;
-        console.log(`[BOOKING] Slot ${finalDay} ${finalTime} unavailable for ${senderId}`);
+        replyText = `Smahlia, dak l-weqt m-3amer 😔 Hado les créneaux disponibles:\n${freshSlots}`;
       }
-
     } else {
-      replyText = aiReply || "Smahlia, ma fhamtch mezian 🙏 Mn fadlak 3awd rassil liya?";
+      replyText = aiReply;
     }
 
-    // ── STEP 10: Atomic DB write ──────────────────────────────────────────────
-    const upsertPayload: Record<string, unknown> = {
-      instagram_id: senderId,
-      has_photo:    hasPhoto || !!finalImage,
-      status:       finalStatus,
-      last_seen_at: new Date().toISOString(),
-    };
+    // ── UPDATE SESSION ────────────────────────────────────────────────────────
+    // Check if we just asked for photo — preserve the flag
+    const justAskedForPhoto =
+      replyText?.includes("tsswira") ||
+      replyText?.includes("galerie") ||
+      replyText?.includes("snano")   ||
+      replyText?.includes("snank");
 
-    if (finalName      !== null) upsertPayload.name        = finalName;
-    if (finalFirstName !== null) upsertPayload.first_name  = finalFirstName;
-    if (finalLastName  !== null) upsertPayload.last_name   = finalLastName;
-    if (finalPhone     !== null) upsertPayload.phone       = finalPhone;
-    if (finalImage     !== null) upsertPayload.last_dental_image = finalImage;
+    // Re-fetch the LATEST session to get values saved earlier
+    // in this same webhook call (e.g. phone saved by early extraction)
+    const latestSess = await getSession(senderId);
 
-    const { error: upsertError } = await supabase
+    await setSession(senderId, {
+      name:            msgName       || mergedName              || latestSess?.name       || freshSession?.name       || null,
+      phone:           msgPhone      || mergedPhone             || latestSess?.phone      || freshSession?.phone      || null,
+      photoUrl:        savedImageUrl || latestSess?.photo_url   || freshSession?.photo_url || null,
+      photoRequested:  justAskedForPhoto ? true : (latestSess?.photo_requested ?? freshSession?.photo_requested ?? false),
+      lastPhotoAskAt:  justAskedForPhoto ? new Date().toISOString() : (latestSess?.last_photo_ask_at ?? freshSession?.last_photo_ask_at ?? null),
+      bizId,
+    });
+    console.log('[SESSION] Final state:', {
+      name:     msgName    || mergedName   || latestSess?.name,
+      phone:    msgPhone   || mergedPhone  || latestSess?.phone,
+      hasPhoto: !!(savedImageUrl || latestSess?.photo_url),
+    });
+
+    // ── DB WRITE (status + metadata only during triage) ───────────────────────
+    const { error: ue } = await supabase
       .from("customers")
-      .upsert(upsertPayload, { onConflict: "instagram_id" });
+      .upsert(
+        {
+          instagram_id:      senderId,
+          status:            finalStatus,
+          last_seen_at:      new Date().toISOString(),
+          business_owner_id: bizId,
+        },
+        { onConflict: "instagram_id" }
+      );
+    if (ue) console.error("[DB UPSERT ERROR]:", ue.message);
 
-    if (upsertError) console.error("[DB UPSERT ERROR]:", upsertError.message);
-
-    // ── STEP 11: Sanity check ─────────────────────────────────────────────────
+    // ── SEND ──────────────────────────────────────────────────────────────────
     if (!replyText || replyText.toLowerCase().includes("null")) {
-      replyText = "Smahlia, ma fhamtch mezian 🙏 Kifach n9drw n3awnek?";
+      return new Response("OK", { status: 200 });
     }
 
-    await sendInstagramMessage(senderId, replyText);
-    return new Response("OK", { status: 200 });
+    // ── ANTI-DUPLICATE REPLY GUARD ──────────────────────────────
+    // 1. In-memory check (fast — same instance, catches race conditions)
+    const lastSent = recentlySentReplies.get(senderId);
+    if (lastSent && (Date.now() - lastSent.at) < 15000) {
+      const isSame = lastSent.text === replyText;
+      const isSimilarPhoto = lastSent.text.includes("tsswira") && replyText?.includes("tsswira");
+      if (isSame || isSimilarPhoto) {
+        console.log("[ANTI-DUPE] In-memory guard blocked duplicate");
+        return new Response("OK", { status: 200 });
+      }
+    }
 
+    // 2. DB check (cross-instance guard — saveMsgHistory runs BEFORE sendDM so the record exists)
+    const { data: recentReply } = await supabase
+      .from("customer_messages")
+      .select("reply_text, timestamp")
+      .eq("customer_id", senderId)
+      .order("timestamp", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (recentReply) {
+      const secondsSince = (Date.now() - new Date(recentReply.timestamp).getTime()) / 1000;
+      const isSameReply = recentReply.reply_text === replyText;
+      const isSimilarPhotoRequest =
+        recentReply.reply_text?.includes("tsswira") && replyText?.includes("tsswira");
+
+      if (secondsSince < 15 && (isSameReply || isSimilarPhotoRequest)) {
+        console.log("[ANTI-DUPE] DB guard blocked duplicate");
+        return new Response("OK", { status: 200 });
+      }
+    }
+    // ────────────────────────────────────────────────────────────
+
+    // Register in-memory before sending
+    recentlySentReplies.set(senderId, { text: replyText, at: Date.now() });
+    setTimeout(() => recentlySentReplies.delete(senderId), 15000);
+
+    // Save to DB BEFORE sending — so any concurrent webhook sees the record immediately
+    await saveMsgHistory(
+      senderId,
+      combinedText || (imageUrl ? "[image]" : ""),
+      replyText,
+      bizId
+    );
+
+    await sendDM(senderId, replyText, token);
+    messageSent = true;
+
+    return new Response("OK", { status: 200 });
   } catch (crashErr) {
     console.error("[CRASH]:", crashErr);
-    if (senderId) await sendInstagramMessage(senderId, "Smahlia, kayn chi 3otla teknik daba 🙏 Rja3 liya men ba3d chwia.");
+    if (!messageSent && senderId) {
+      const { data: biz } = await supabase
+        .from("buisness_owner")
+        .select("page_access_token")
+        .maybeSingle();
+      await sendDM(
+        senderId,
+        "Smahlia, kayn chi 3otla teknik 🙏 Rja3 liya men ba3d chwia.",
+        biz?.page_access_token ?? ""
+      );
+    }
     return new Response("OK", { status: 200 });
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SAVE DENTAL PHOTO
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function saveDentalPhoto(instagramUrl: string, senderId: string): Promise<string | null> {
-  try {
-    const res = await fetch(instagramUrl);
-    if (!res.ok) { console.error(`[PHOTO] CDN fetch failed: ${res.status}`); return null; }
-    const contentType = res.headers.get("content-type") ?? "image/jpeg";
-    const ext    = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-    const buffer = await res.arrayBuffer();
-    const path   = `${senderId}/${Date.now()}.${ext}`;
-    const { error } = await supabase.storage.from("dental-images").upload(path, buffer, { contentType, upsert: false });
-    if (error) { console.error("[PHOTO] Upload failed:", error.message); return null; }
-    const { data: urlData } = supabase.storage.from("dental-images").getPublicUrl(path);
-    console.log(`[PHOTO] Saved: ${urlData.publicUrl}`);
-    return urlData.publicUrl;
-  } catch (err) { console.error("[PHOTO] Exception:", err); return null; }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SEND INSTAGRAM DM
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function sendInstagramMessage(recipientId: string, text: string): Promise<void> {
-  if (!recipientId || !text) return;
-  try {
-    const res = await fetch(
-      `https://graph.facebook.com/v21.0/me/messages?access_token=${process.env.INSTAGRAM_ACCESS_TOKEN}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ recipient: { id: recipientId }, message: { text } }),
-      }
-    );
-    const json = await res.json();
-    if (!res.ok) console.error("[DM ERROR]:", JSON.stringify(json));
-    else console.log(`[DM SENT] to=${recipientId} | "${text.substring(0, 80)}"`);
-  } catch (err) { console.error("[DM FETCH ERROR]:", err); }
 }
