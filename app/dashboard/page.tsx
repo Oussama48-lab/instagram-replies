@@ -653,7 +653,7 @@ export default function CommandCenterPage() {
                     onClick={async () => {
                       const { data: { session } } = await supabase.auth.getSession();
                       const state = session?.access_token || '';
-                      const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${process.env.NEXT_PUBLIC_META_APP_ID}&redirect_uri=${process.env.NEXT_PUBLIC_BASE_URL}/auth/instagram/callback&scope=pages_show_list,pages_read_engagement,instagram_basic,instagram_manage_messages,business_management&response_type=code&state=${encodeURIComponent(state)}`;
+                      const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${process.env.NEXT_PUBLIC_META_APP_ID}&redirect_uri=${process.env.NEXT_PUBLIC_BASE_URL}/auth/instagram/callback&scope=instagram_basic,instagram_manage_messages,pages_show_list,pages_read_engagement&response_type=code&state=${encodeURIComponent(state)}`;
                       window.location.href = url;
                     }}
                     className="block w-full rounded-xl bg-gradient-to-r from-purple-500 to-fuchsia-500 px-3 py-2.5 text-center text-sm font-medium text-white transition hover:brightness-110"
