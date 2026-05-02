@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
     console.log("[IG CONNECT] redirect_uri:", redirectUri);
 
     // ── Step 1: Exchange code for short-lived token ───────────────────────────
-    const tokenRes = await fetch("https://graph.facebook.com/v18.0/oauth/access_token", {
+    const tokenRes = await fetch("https://graph.facebook.com/v25.0/oauth/access_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -53,7 +53,7 @@ export async function POST(req: NextRequest) {
     const shortLivedToken: string = tokenData.access_token;
 
     // ── Step 2: Exchange for long-lived token ─────────────────────────────────
-    const longTokenUrl = new URL("https://graph.facebook.com/v18.0/oauth/access_token");
+    const longTokenUrl = new URL("https://graph.facebook.com/v25.0/oauth/access_token");
     longTokenUrl.searchParams.set("grant_type",        "fb_exchange_token");
     longTokenUrl.searchParams.set("client_id",         process.env.META_APP_ID!);
     longTokenUrl.searchParams.set("client_secret",     process.env.META_APP_SECRET!);
@@ -70,7 +70,7 @@ export async function POST(req: NextRequest) {
     const longLivedToken: string = longTokenData.access_token;
 
     // ── Step 3: Get Facebook Pages ────────────────────────────────────────────
-    const pagesRes  = await fetch(`https://graph.facebook.com/v18.0/me/accounts?access_token=${longLivedToken}`);
+    const pagesRes  = await fetch(`https://graph.facebook.com/v25.0/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${longLivedToken}`);
     const pagesData = await pagesRes.json();
     console.log('[PAGES RESPONSE]:', JSON.stringify(pagesData));
 
@@ -91,34 +91,18 @@ export async function POST(req: NextRequest) {
     let instagramAccountId: string | null = null;
     let pageAccessToken:    string | null = null;
     let facebookPageId:     string | null = null;
+    let instagramUsername:  string | null = null;
 
     for (const page of pages) {
-      console.log(`[IG CONNECT] step4 querying page id=${page.id} name=${page.name ?? "unknown"}`);
-
-      // Attempt 1 - standard way (page token)
-      const igRes = await fetch(
-        `https://graph.facebook.com/v25.0/${page.id}?fields=instagram_business_account&access_token=${page.access_token}`
-      );
-      const igData = await igRes.json();
-      console.log('[IG ATTEMPT 1]:', JSON.stringify(igData));
-
-      // Attempt 2 - try with user token instead of page token
-      const igRes2 = await fetch(
-        `https://graph.facebook.com/v25.0/${page.id}?fields=instagram_business_account&access_token=${shortLivedToken}`
-      );
-      const igData2 = await igRes2.json();
-      console.log('[IG ATTEMPT 2]:', JSON.stringify(igData2));
-
-      const foundId = igData.instagram_business_account?.id ?? igData2.instagram_business_account?.id ?? null;
-
-      if (foundId) {
-        instagramAccountId = foundId;
+      const igId = page.instagram_business_account?.id ?? null;
+      const igUsername = page.instagram_business_account?.username ?? null;
+      console.log(`[IG CONNECT] page=${page.id} igId=${igId} igUsername=${igUsername}`);
+      if (igId) {
+        instagramAccountId = igId;
+        instagramUsername  = igUsername;
         pageAccessToken    = page.access_token;
         facebookPageId     = page.id;
-        console.log(`[IG CONNECT] step4 found IG business account id=${instagramAccountId} on page ${facebookPageId}`);
         break;
-      } else {
-        console.log(`[IG CONNECT] step4 no IG business account on page ${page.id}`);
       }
     }
 
@@ -129,16 +113,6 @@ export async function POST(req: NextRequest) {
         error: "No Instagram Business Account linked to any of your Pages.",
       });
     }
-
-    // ── Step 5: Fetch Instagram username ─────────────────────────────────────
-    console.log(`[IG CONNECT] step5 fetching username for IG account id=${instagramAccountId}`);
-    const usernameRes  = await fetch(
-      `https://graph.facebook.com/v25.0/${instagramAccountId}?fields=username&access_token=${pageAccessToken}`
-    );
-    const usernameData          = await usernameRes.json();
-    console.log("[IG CONNECT] step5 full response:", JSON.stringify(usernameData));
-    const instagramUsername: string | null = usernameData.username ?? null;
-    console.log("[IG CONNECT] step5 instagram_username resolved to:", instagramUsername ?? "NONE");
 
     // ── Step 6: Persist to buisness_owner ────────────────────────────────────
     console.log("[IG CONNECT] step6 updating buisness_owner where auth_user_id =", user.id);
