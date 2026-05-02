@@ -93,17 +93,21 @@ export async function POST(req: NextRequest) {
     let facebookPageId:     string | null = null;
 
     for (const page of pages) {
+      console.log(`[IG CONNECT] step4 querying page id=${page.id} name=${page.name ?? "unknown"}`);
       const igRes  = await fetch(
-        `https://graph.facebook.com/v18.0/${page.id}?fields=instagram_business_account&access_token=${page.access_token}`
+        `https://graph.facebook.com/v25.0/${page.id}?fields=instagram_business_account&access_token=${page.access_token}`
       );
       const igData = await igRes.json();
-      console.log(`[IG CONNECT] step4 page ${page.id} IG account:`, JSON.stringify(igData).substring(0, 200));
+      console.log(`[IG CONNECT] step4 full response for page ${page.id}:`, JSON.stringify(igData));
 
       if (igData.instagram_business_account?.id) {
         instagramAccountId = igData.instagram_business_account.id;
         pageAccessToken    = page.access_token;
         facebookPageId     = page.id;
+        console.log(`[IG CONNECT] step4 found IG business account id=${instagramAccountId} on page ${facebookPageId}`);
         break;
+      } else {
+        console.log(`[IG CONNECT] step4 no IG business account on page ${page.id}`);
       }
     }
 
@@ -116,12 +120,14 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Step 5: Fetch Instagram username ─────────────────────────────────────
+    console.log(`[IG CONNECT] step5 fetching username for IG account id=${instagramAccountId}`);
     const usernameRes  = await fetch(
-      `https://graph.facebook.com/v18.0/${instagramAccountId}?fields=username&access_token=${pageAccessToken}`
+      `https://graph.facebook.com/v25.0/${instagramAccountId}?fields=username&access_token=${pageAccessToken}`
     );
     const usernameData          = await usernameRes.json();
+    console.log("[IG CONNECT] step5 full response:", JSON.stringify(usernameData));
     const instagramUsername: string | null = usernameData.username ?? null;
-    console.log("[IG CONNECT] step5 username:", instagramUsername ?? "NONE", "| raw:", JSON.stringify(usernameData).substring(0, 200));
+    console.log("[IG CONNECT] step5 instagram_username resolved to:", instagramUsername ?? "NONE");
 
     // ── Step 6: Persist to buisness_owner ────────────────────────────────────
     console.log("[IG CONNECT] step6 updating buisness_owner where auth_user_id =", user.id);
