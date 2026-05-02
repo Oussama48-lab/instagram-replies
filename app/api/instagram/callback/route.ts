@@ -94,14 +94,25 @@ export async function POST(req: NextRequest) {
 
     for (const page of pages) {
       console.log(`[IG CONNECT] step4 querying page id=${page.id} name=${page.name ?? "unknown"}`);
-      const igRes  = await fetch(
+
+      // Attempt 1 - standard way (page token)
+      const igRes = await fetch(
         `https://graph.facebook.com/v25.0/${page.id}?fields=instagram_business_account&access_token=${page.access_token}`
       );
       const igData = await igRes.json();
-      console.log(`[IG CONNECT] step4 full response for page ${page.id}:`, JSON.stringify(igData));
+      console.log('[IG ATTEMPT 1]:', JSON.stringify(igData));
 
-      if (igData.instagram_business_account?.id) {
-        instagramAccountId = igData.instagram_business_account.id;
+      // Attempt 2 - try with user token instead of page token
+      const igRes2 = await fetch(
+        `https://graph.facebook.com/v25.0/${page.id}?fields=instagram_business_account&access_token=${shortLivedToken}`
+      );
+      const igData2 = await igRes2.json();
+      console.log('[IG ATTEMPT 2]:', JSON.stringify(igData2));
+
+      const foundId = igData.instagram_business_account?.id ?? igData2.instagram_business_account?.id ?? null;
+
+      if (foundId) {
+        instagramAccountId = foundId;
         pageAccessToken    = page.access_token;
         facebookPageId     = page.id;
         console.log(`[IG CONNECT] step4 found IG business account id=${instagramAccountId} on page ${facebookPageId}`);
