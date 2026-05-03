@@ -493,15 +493,7 @@ export async function POST(req: Request) {
 
     // ── ECHO ────────────────────────────────────────────────────────────────
     if (messaging.message?.is_echo) {
-      if (recipientId) {
-        const { data: upd } = await supabase
-          .from("customers")
-          .update({ status: "DOCTOR_REPLIED" })
-          .eq("instagram_id", recipientId)
-          .eq("status", "WAITING_FOR_DOCTOR")
-          .select("id");
-        if (upd?.length) console.log(`[ECHO] → DOCTOR_REPLIED`);
-      }
+      console.log(`[ECHO] Ignored — status changes only happen via dashboard`);
       return new Response("OK", { status: 200 });
     }
 
