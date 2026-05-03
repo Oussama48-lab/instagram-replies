@@ -52,8 +52,20 @@ const DAY_LABEL: Record<string, string> = {
 };
 
 const TIME_LABEL: Record<string, string> = {
-  "9a": "09h00", "11a": "11h00", "1p": "13h00",
-  "3p": "15h00", "4p": "16h00", "5p": "17h00",
+  "9a":  "09h00",
+  "10a": "10h00",
+  "11a": "11h00",
+  "12p": "12h00",
+  "1p":  "13h00",
+  "2p":  "14h00",
+  "3p":  "15h00",
+  "4p":  "16h00",
+  "5p":  "17h00",
+  "6p":  "18h00",
+  "7p":  "19h00",
+  "8p":  "20h00",
+  "9p":  "21h00",
+  "10p": "22h00",
 };
 
 const DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -582,6 +594,11 @@ export async function POST(req: Request) {
       .maybeSingle();
     const currentStatus = statusRow?.status as BotStatus | null;
 
+    if (currentStatus === "WAITING_FOR_DOCTOR" || currentStatus === "ARCHIVED") {
+      console.log(`[EARLY EXIT] Status ${currentStatus} — silent.`);
+      return new Response("OK", { status: 200 });
+    }
+
     // These statuses need immediate handling — never buffer them
     const bypassBuffer =
       currentStatus === "WAITING_FOR_CONSENT" ||
@@ -751,8 +768,8 @@ Patient message: "${combinedText || messageText}"`;
     }
 
     // ── STATUS GUARDS ────────────────────────────────────────────────────────
-    if (profile.status === "WAITING_FOR_DOCTOR") {
-      console.log(`[PAUSE] Silent.`);
+    if (profile.status === "WAITING_FOR_DOCTOR" || currentStatus === "WAITING_FOR_DOCTOR") {
+      console.log(`[PAUSE] WAITING_FOR_DOCTOR — completely silent.`);
       return new Response("OK", { status: 200 });
     }
     if (profile.status === "ARCHIVED") {
