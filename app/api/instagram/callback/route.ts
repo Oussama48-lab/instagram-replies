@@ -116,6 +116,35 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Attempt 4 — query each page ID directly for instagram_business_account
+    if (!instagramAccountId) {
+      // Get all page IDs the user granted access to during OAuth
+      const allPagesRes  = await fetch(
+        `https://graph.facebook.com/v25.0/me/accounts?fields=id,name,access_token&access_token=${longLivedToken}`
+      );
+      const allPagesData = await allPagesRes.json();
+      console.log("[IG CONNECT] attempt4 all pages:", JSON.stringify(allPagesData));
+
+      const allPages: any[] = allPagesData.data ?? [];
+
+      for (const page of allPages) {
+        const pageDetailRes = await fetch(
+          `https://graph.facebook.com/v25.0/${page.id}?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${page.access_token ?? longLivedToken}`
+        );
+        const pageDetail = await pageDetailRes.json();
+        console.log(`[IG CONNECT] attempt4 page ${page.id} detail:`, JSON.stringify(pageDetail));
+
+        if (pageDetail.instagram_business_account?.id) {
+          instagramAccountId = pageDetail.instagram_business_account.id;
+          instagramUsername  = pageDetail.instagram_business_account.username ?? null;
+          pageAccessToken    = pageDetail.access_token ?? page.access_token ?? longLivedToken;
+          facebookPageId     = page.id;
+          console.log(`[IG CONNECT] attempt4 found: page=${facebookPageId} ig=${instagramAccountId}`);
+          break;
+        }
+      }
+    }
+
     if (!instagramAccountId) {
       return NextResponse.json({
         error: "Could not find Instagram Business Account. Make sure your Facebook Page is connected to an Instagram Business Account.",
