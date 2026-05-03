@@ -145,6 +145,23 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Attempt 5 — Instagram Business Login API (different endpoint)
+    if (!instagramAccountId) {
+      const igUserRes  = await fetch(
+        `https://graph.facebook.com/v25.0/me?fields=id,username,name&access_token=${longLivedToken}`
+      );
+      const igUserData = await igUserRes.json();
+      console.log("[IG CONNECT] attempt5 /me instagram login:", JSON.stringify(igUserData));
+
+      if (igUserData.id && !igUserData.error) {
+        instagramAccountId = igUserData.id;
+        instagramUsername  = igUserData.username ?? null;
+        pageAccessToken    = longLivedToken;
+        facebookPageId     = igUserData.id;
+        console.log(`[IG CONNECT] attempt5 found: ig=${instagramAccountId} username=${instagramUsername}`);
+      }
+    }
+
     if (!instagramAccountId) {
       return NextResponse.json({
         error: "Could not find Instagram Business Account. Make sure your Facebook Page is connected to an Instagram Business Account.",
